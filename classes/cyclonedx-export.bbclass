@@ -1105,8 +1105,9 @@ def append_cve_status(d):
         detail = vuln["detail"]
         if status == "Unpatched":
             continue
-        detail = detail_map.get(detail, detail)
-        d.setVarFlag("CVE_STATUS", cveid, detail)
+        detail = detail_map.get(detail, detail) + ": CYCLONEDX_IMPROVE_KERNEL_CVE_REPORT"
+        if d.getVarFlag("CVE_STATUS", cveid, True) is None:
+            d.setVarFlag("CVE_STATUS", cveid, detail)
 
 
 python do_populate_cyclonedx:prepend() {
