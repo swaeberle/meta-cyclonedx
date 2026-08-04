@@ -1070,11 +1070,10 @@ def make_complist(d):
 def run_kernel_cve_report(d):
     import subprocess
     workdir = d.getVar("WORKDIR")
-    unpackdir = d.getVar("UNPACKDIR")
     layerdir = d.getVar("CYCLONEDX_LAYERDIR")
     script = os.path.join(layerdir, "meta/files/improve_kernel_cve_report.py")
     complist = os.path.join(workdir, "linux-kernel-compile-list.txt")
-    datadir = os.path.join(unpackdir, "vulns")
+    datadir = os.path.join(workdir, "vulns")
     cvereport = os.path.join(workdir, "cve-report.json")
 
     subprocess.check_call(["python3", script,
