@@ -25,6 +25,7 @@ CYCLONEDX_ADD_COMPONENT_SCOPES ??= "1"
 # Set to "0" to disable for minimal VEX documents
 # Available in CycloneDX 1.6
 CYCLONEDX_ADD_VULN_TIMESTAMPS ??= "1"
+CYCLONEDX_IMPROVE_KERNEL_CVE_VULNS_URL ??= "git.kernel.org/pub/scm/linux/security/vulns.git"
 
 # Include unpatched vulnerabilities in VEX.
 # If enabled, the cve-check class is inherited to query the NVD.
@@ -1119,7 +1120,8 @@ python do_populate_cyclonedx:prepend() {
 python () {
     provides = d.getVar("PROVIDES") or ""
     if "virtual/kernel" in provides.split() and d.getVar("CYCLONEDX_IMPROVE_KERNEL_CVE_REPORT") == "1":
-        d.appendVar("SRC_URI", " git://git.kernel.org/pub/scm/linux/security/vulns.git;protocol=https;branch=master;name=vulns;destsuffix=vulns")
+        vulns_url = d.getVar("CYCLONEDX_IMPROVE_KERNEL_CVE_VULNS_URL", "git.kernel.org/pub/scm/linux/security/vulns.git")
+        d.appendVar("SRC_URI", f" git://{vulns_url};protocol=https;branch=master;name=vulns;destsuffix=vulns")
         d.appendVar("SRCREV_FORMAT", "_vulns")
         d.setVar("SRCREV_vulns", "master")
         # creation of .cmd files must complete before do_populate_cyclonedx executes
