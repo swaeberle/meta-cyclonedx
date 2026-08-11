@@ -147,16 +147,20 @@ Multiple image names are separated by spaces.
 - **Deduplication by CPE.** A component that exists in both SBOMs is kept
   exactly once (the parent's copy wins). Dependency edges from both images
   are preserved under the parent's `bom-ref`, so the dependency graph
-  remains complete.
+  remains complete. The surviving copy keeps the more significant of the two
+  scopes, ordered `required` > `optional` > `excluded`.
 - **Unique components** from the included image are added to the parent SBOM
-  with `scope = "required"`.
+  with `scope = "required"`, unless they already declare a scope of their own.
 - **The included image itself** appears as an additional `firmware` component
-  in the parent SBOM and is listed as a direct dependency of the parent image
-  in the root `dependsOn` entry.
+  with `scope = "required"` in the parent SBOM and is listed as a direct
+  dependency of the parent image in the root `dependsOn` entry.
 - **VEX vulnerabilities** are merged: the included image's SBOM serial is
   remapped to the parent's, shared `bom-ref`s are remapped, and CVE IDs are
   deduplicated — additional `affects` entries are appended to existing
   vulnerability records rather than creating duplicates.
+
+All scope handling above is skipped when `CYCLONEDX_ADD_COMPONENT_SCOPES` is
+disabled.
 
 **Task ordering** is handled automatically. BitBake injects a
 `do_deploy_cyclonedx` dependency for each listed image into the parent's

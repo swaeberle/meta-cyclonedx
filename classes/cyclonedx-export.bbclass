@@ -713,6 +713,18 @@ def list_runtime_recipes_from_depends(d, depends):
             runtime_recipes.add(recipe)
     return runtime_recipes
 
+def highest_priority_scope(*scopes):
+    """
+    Return the most significant of the given CycloneDX scopes, ordered
+    required > optional > excluded. Unknown or missing values are ignored,
+    and None is returned when no scope is known.
+    """
+    priority = ["required", "optional", "excluded"]
+    known = [scope for scope in scopes if scope in priority]
+    if not known:
+        return None
+    return min(known, key=priority.index)
+
 def resolve_extra_image_sbom_paths(d):
     # Paths follow IMAGE_LINK_NAME convention; all images share CYCLONEDX_EXPORT_DIR = DEPLOY_DIR_IMAGE.
     export_dir = d.getVar("CYCLONEDX_EXPORT_DIR")
@@ -988,6 +1000,10 @@ def export_cyclonedx(d):
             )
             if existing:
                 included_bom_ref_remap[inc_ref] = existing["bom-ref"]
+                if d.getVar("CYCLONEDX_ADD_COMPONENT_SCOPES") == "1":
+                    merged_scope = highest_priority_scope(existing.get("scope"), inc_comp.get("scope"))
+                    if merged_scope:
+                        existing["scope"] = merged_scope
 
         # Add components unique to the included image (no CPE match in the parent SBOM).
         for inc_comp in img_sbom_data.get("components") or []:
@@ -996,7 +1012,7 @@ def export_cyclonedx(d):
                 continue
             if inc_ref and inc_ref in extra_seen_image_refs:
                 continue
-            if d.getVar("CYCLONEDX_ADD_COMPONENT_SCOPES") == "1":
+            if d.getVar("CYCLONEDX_ADD_COMPONENT_SCOPES") == "1" and "scope" not in inc_comp:
                 inc_comp = dict(inc_comp)
                 inc_comp["scope"] = "required"
             sbom["components"].append(inc_comp)
@@ -1006,12 +1022,15 @@ def export_cyclonedx(d):
         # Represent the included image itself as a firmware component in the parent SBOM.
         inc_metadata_comp = (img_sbom_data.get("metadata") or {}).get("component") or {}
         img_firmware_ref = str(uuid.uuid4())
-        sbom["components"].append({
+        img_firmware_comp = {
             "type": "firmware",
             "name": img_name,
             "version": inc_metadata_comp.get("version") or "unknown",
             "bom-ref": img_firmware_ref,
-        })
+        }
+        if d.getVar("CYCLONEDX_ADD_COMPONENT_SCOPES") == "1":
+            img_firmware_comp["scope"] = "required"
+        sbom["components"].append(img_firmware_comp)
         extra_seen_image_refs.add(img_firmware_ref)
         # The embedded image is a direct child of the parent image in the dependency tree.
         directly_installed_component_refs.add(img_firmware_ref)
@@ -1107,10 +1126,16 @@ def export_cyclonedx(d):
     # This must be done after all vulnerabilities are collected to ensure each image
     # gets its own SBOM serial number in multi-output builds (e.g., rootfs + initramfs)
     for vuln in vex["vulnerabilities"]:
+        affects = []
         for affect in vuln.get("affects", []):
             if "ref" in affect:
                 affect["ref"] = affect["ref"].replace(
                     d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'), sbom_serial_number)
+            # Refs merged from another image only become comparable to this
+            # document's own, still-templated refs once the serial is substituted.
+            if affect not in affects:
+                affects.append(affect)
+        vuln["affects"] = affects
 
     export_dir = d.getVar("CYCLONEDX_EXPORT_DIR")
     tmp_export_dir = d.getVar("CYCLONEDX_TMP_EXPORT_DIR")
