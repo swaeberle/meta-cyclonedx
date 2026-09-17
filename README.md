@@ -125,6 +125,112 @@ Multiple recipe names are separated by spaces. Each listed recipe must have
 already run `do_populate_cyclonedx` during the build, otherwise an error is
 raised and the recipe is skipped.
 
+### Recipe-contributed CycloneDX Fragments
+
+Language ecosystems that resolve their own dependency trees — cargo, npm, go —
+are invisible to OpenEmbedded's package model. The image BOM lists the recipe
+that builds the binary, but not the modules linked into it, so for instance a
+Rust service appears as a single component while the crates it depends on
+(and their advisories) are missing.
+
+A recipe can close that gap by generating a CycloneDX document at build time and
+pointing `CYCLONEDX_EXTRA_BOM_FILES` at it:
+
+```sh
+CYCLONEDX_EXTRA_BOM_FILES = "${B}/cargo-cyclonedx.json"
+```
+
+Multiple documents are separated by spaces. Each file is read during
+`do_populate_cyclonedx`, so it must already exist by then — a recipe that
+generates the document while building should order the task accordingly:
+
+```sh
+addtask do_populate_cyclonedx after do_compile
+```
+
+The components and dependency edges are merged into the image BOM verbatim.
+They already carry their own bom-refs, purls and dependency edges, so the CPE
+deduplication and the recipe-name dependency remapping applied to Yocto-derived
+components are deliberately skipped — those would corrupt an externally
+resolved tree. Duplicate `bom-ref`s (the same crate pulled in by two recipes)
+are dropped, keeping the first occurrence.
+
+The document's own root — `metadata.component`, the module the recipe builds —
+is carried over as a component too, and a dependency edge is added from the
+contributing recipe's component to it. The resulting tree therefore hangs off
+the package it belongs to:
+
+```
+ripgrep (pkg:yocto)          the recipe, as discovered by Yocto
+└── ripgrep (metadata.component of the contributed document)
+    └── regex (pkg:cargo) → aho-corasick (pkg:cargo) → …
+```
+
+Both steps are needed: CycloneDX does not repeat `metadata.component` inside
+`components`, yet the document's dependency edges reference it, so without
+them the merged tree would hang off an unresolvable bom-ref and the modules
+would float unattributed at the top level of the BOM.
+
+By default, a missing or unparsable file will cause the build to fail.
+You may change this behavior to emit only a warning instead
+by setting:
+
+```sh
+CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES = "0"
+```
+
+### Extra Runtime Image Recipes
+
+Some images embed another complete image inside them — the most common case is a
+initramfs that is bundled into a fitImage. The embedded image has its own rootfs
+and its own components, and those components belong in the outer image's SBOM.
+
+Because the embedded image is built separately, its SBOM is generated and
+deployed independently. Use `CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES` to name the
+image recipes whose completed SBOMs should be merged into the current image's
+SBOM+VEX:
+
+```sh
+CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES = "dm-verity-image-initramfs"
+```
+
+Multiple image names are separated by spaces.
+
+**Merging behaviour:**
+
+- **Deduplication by CPE.** A component that exists in both SBOMs is kept
+  exactly once (the parent's copy wins). Dependency edges from both images
+  are preserved under the parent's `bom-ref`, so the dependency graph
+  remains complete. The surviving copy keeps the more significant of the two
+  scopes, ordered `required` > `optional` > `excluded`.
+- **Unique components** from the included image are added to the parent SBOM
+  with `scope = "required"`, unless they already declare a scope of their own.
+- **The included image itself** appears as an additional `firmware` component
+  with `scope = "required"` in the parent SBOM and is listed as a direct
+  dependency of the parent image in the root `dependsOn` entry.
+- **VEX vulnerabilities** are merged: the included image's SBOM serial is
+  remapped to the parent's, shared `bom-ref`s are remapped, and CVE IDs are
+  deduplicated — additional `affects` entries are appended to existing
+  vulnerability records rather than creating duplicates.
+
+All scope handling above is skipped when `CYCLONEDX_ADD_COMPONENT_SCOPES` is
+disabled.
+
+**Task ordering** is handled automatically. BitBake injects a
+`do_deploy_cyclonedx` dependency for each listed image into the parent's
+`do_rootfs`, so the included SBOM symlink is guaranteed to be on disk before
+the export runs.
+
+The SBOM is located by the standard `IMAGE_LINK_NAME` symlink convention:
+
+```
+${CYCLONEDX_EXPORT_DIR}/{img_name}-{MACHINE}.cyclonedx.bom.json
+```
+
+If the symlink does not exist (e.g. the image name is wrong or the included
+image was not built), a warning is emitted and the image is skipped without
+failing the build.
+
 ### Component Scopes
 
 When including both runtime and build-time packages, meta-cyclonedx uses
@@ -393,6 +499,13 @@ permissions.
 An example python script can be found at
 `examples/automated-dependencytrack-upload.py` and may be freely used (CC0-1.0).
 
+## Contributing
+
+Thanks for your interest in contributing to `meta-cyclonedx`!
+
+Please read the dedicated [./CONTRIBUTING.md](CONTRIBUTING.md) file before
+opening issues or pull requests.
+
 ## Known Limitations
 
 ### Potentially Missing Packages After Run-time Filtering
@@ -407,26 +520,15 @@ downsides (i.e. Missing some packages), as discussed
 ### Missing Dependencies with Modern Programming Languages
 
 OpenEmbedded and its core mechanisms work best with "traditional" programming
-languages such as C and C++, as these are the languages that they were initially
-designed around. For instance, a core-assumption prevalent in many OE mechanisms
-(including those we depend on in meta-cyclonedx) is that each library is
-described in its own OE recipe. This however does not work well with many
-modern programming languages, which often come with their own package managers
-(e.g. NPM, Cargo, Go Modules, ...), which do not necessarily integrate well
-into the OpenEmbedded ecosystem and depend of potentially hundreds of external
-dependencies (good luck writing a separate OE recipe for each dependency in a
-small-medium sized Node.js project).
+languages such as C and C++, as these are the languages that they were
+initially designed around. For instance, a core-assumption prevalent in many
+OE mechanisms (including those we depend on in meta-cyclonedx) is that each
+library is described in its own OE recipe. This however does not work well
+with many modern programming languages, which often come with their own package
+managers (e.g. NPM, Cargo, Go Modules, ...), which OpenEmbedded does not know
+about. As a result, additional dependencies pulled in by the respective
+programming language's package manager will be missing from the SBOM
+generated by this layer, unless additional steps are taken.
 
-Thus, if you rely on packages written in programming languages that come with
-their own package managers, you might be better off with a divide and
-conquer approach for covering their packages as well (your mileage may vary):
-
-1. Use this meta-layer to generate a CycloneDX SBOM which covers your OE-based
-   operating system, system libraries, etc.
-2. Use tools designed explicitly for generating CycloneDX SBOMs for these
-   languages (e.g. [Rust](https://github.com/CycloneDX/cyclonedx-rust-cargo),
-   [NPM](https://github.com/CycloneDX/cyclonedx-node-npm),
-   [Golang](https://github.com/CycloneDX/cyclonedx-gomod), ...)
-3. Optionally, use some glue code to merge the SBOMs together
-   ([cyclonedx-cli](https://github.com/CycloneDX/cyclonedx-cli) offers merge
-   functionality)
+Please refer to the section [Recipe-contributed CycloneDX Fragments](#recipe-contributed-cyclonedx-fragments)
+on how to include these dependencies in the SBOM generation process.
