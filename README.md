@@ -90,6 +90,14 @@ version, CI build number, or git tag):
 CYCLONEDX_IMAGE_VERSION = "2026.07.0"
 ```
 
+### Image Component Name
+The name of the top-level image component in metadata is `${IMAGE_BASENAME}` by default.
+You can change the name if necessary:
+
+```sh
+CYCLONEDX_IMAGE_NAME = "Fancy Image"
+```
+
 ### Image Component Type
 
 The type of the top-level image component in metadata is `firmware` by default.
@@ -318,6 +326,19 @@ CYCLONEDX_COMPONENT_PROPERTIES = "custom:modified=true custom:team=platform"
 
 Entries missing an `=` are skipped with a warning rather than failing the
 build. The variable is empty (no properties added) by default.
+
+### Package URLs
+
+By default, each component gets a generic purl derived from `CVE_PRODUCT` and
+`CVE_VERSION`, e.g. `pkg:generic/vendor/product@1.0`.
+
+A recipe can declare its canonical purl instead by setting
+`SPDX_PACKAGE_URLS` (the same variable used by `create-spdx-3.0` in newer
+Yocto releases). If set, its first entry is used:
+
+```sh
+SPDX_PACKAGE_URLS = "pkg:github/example/my-app@1.2.3"
+```
 
 ### Minimal SBOM Configuration
 

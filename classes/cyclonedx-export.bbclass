@@ -40,6 +40,9 @@ CYCLONEDX_UNPATCHED_VULNS_STATE ??= "in_triage"
 
 CYCLONEDX_RUNTIME_PACKAGES_ONLY ??= "1"
 
+# Name string for metadata.component in the CycloneDX SBOM.
+CYCLONEDX_IMAGE_NAME ??= "${IMAGE_BASENAME}"
+
 # Type string for metadata.component in the CycloneDX SBOM.
 CYCLONEDX_IMAGE_TYPE ??= "firmware"
 
@@ -193,7 +196,7 @@ python do_populate_cyclonedx() {
     bom_ref_dedup_map = {}
 
     # append all defined package names for recipe to pn_list pkgs
-    for pkg in generate_packages_list(name, version):
+    for pkg in generate_packages_list(d, name, version):
         # Check if we already have a package with this CPE
         existing_pkg = next((c for c in pn_list["pkgs"] if c["cpe"] == pkg["cpe"]), None)
         if existing_pkg:
@@ -574,7 +577,7 @@ def resolve_dependency_refs(depends, recipe_refs, component_recipes, ref_recipes
 
     return list(recipe_refs[recipe])
 
-def generate_packages_list(products_names, version):
+def generate_packages_list(d, products_names, version):
     """
     Get a list of products and generate CPE and PURL identifiers for each of them.
     """
@@ -589,6 +592,11 @@ def generate_packages_list(products_names, version):
     if not version or version.strip() == "":
         version = "unknown"
 
+    # Recipes may declare their canonical purl(s) via SPDX_PACKAGE_URLS (same
+    # variable as used by create-spdx-3.0 in newer releases). Use the first entry
+    # if set, otherwise fall back to a generic purl.
+    spdx_purls = (d.getVar("SPDX_PACKAGE_URLS") or "").split()
+
     # some packages have alternative names, so we split CVE_PRODUCT
     # convert to set to avoid duplicates
     for product in set(products_names.split()):
@@ -599,12 +607,17 @@ def generate_packages_list(products_names, version):
         else:
             vendor = ""
 
+        if spdx_purls:
+            purl = spdx_purls[0]
+        else:
+            purl = 'pkg:generic/{}{}@{}'.format(f"{vendor}/" if vendor else '', product, version)
+
         pkg = {
             "name": product,
             "version": version,
             "type": "library",
             "cpe": 'cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*'.format(vendor or "*", product, version),
-            "purl": 'pkg:generic/{}{}@{}'.format(f"{vendor}/" if vendor else '', product, version),
+            "purl": purl,
             "bom-ref": str(uuid.uuid4())
         }
         if vendor != "":
@@ -896,21 +909,28 @@ def highest_priority_scope(*scopes):
     return min(known, key=priority.index)
 
 def resolve_extra_image_sbom_paths(d):
-    # Paths follow IMAGE_LINK_NAME convention; all images share CYCLONEDX_EXPORT_DIR = DEPLOY_DIR_IMAGE.
-    export_dir = d.getVar("CYCLONEDX_EXPORT_DIR")
-    machine = d.getVar("MACHINE")
+    # Re-expand the SBOM/VEX path templates with IMAGE_BASENAME set to the
+    # referenced image, so the path is produced by exactly the same expression
+    # that image used to write the file. Reconstructing the name by hand breaks
+    # on IMAGE_NAME_SUFFIX, which is per recipe (initramfs images set it empty).
     current_pn = d.getVar("PN")
+    raw_sbom = d.getVar("CYCLONEDX_EXPORT_SBOM", False)
+    raw_vex = d.getVar("CYCLONEDX_EXPORT_VEX", False)
     results = []
     for img_name in (d.getVar("CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES") or "").split():
         if img_name == current_pn:
             bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: skipping self-reference '{img_name}'")
             continue
-        link_basename = f"{img_name}-{machine}"
-        results.append((
-            img_name,
-            os.path.join(export_dir, f"{link_basename}.cyclonedx.bom.json"),
-            os.path.join(export_dir, f"{link_basename}.cyclonedx.vex.json"),
-        ))
+        d2 = d.createCopy()
+        d2.setVar("IMAGE_BASENAME", img_name)
+        d2.setVar("PN", img_name)
+        sbom = d2.expand(raw_sbom)
+        vex = d2.expand(raw_vex)
+        if sbom == d.getVar("CYCLONEDX_EXPORT_SBOM"):
+            bb.error("CYCLONEDX_EXPORT_SBOM does not vary with IMAGE_BASENAME; "
+                     f"cannot locate the SBOM for '{img_name}'")
+            continue
+        results.append((img_name, sbom, vex))
     return results
 
 def export_cyclonedx(d):
@@ -927,7 +947,7 @@ def export_cyclonedx(d):
     timestamp = datetime.now(timezone.utc).isoformat()
 
     image_type = d.getVar("CYCLONEDX_IMAGE_TYPE") or "firmware"
-    image_name = d.getVar("IMAGE_BASENAME") or d.getVar("PN") or "image"
+    image_name = d.getVar("CYCLONEDX_IMAGE_NAME") or d.getVar("PN") or "image"
     image_version = d.getVar("CYCLONEDX_IMAGE_VERSION") or "unknown"
     metadata_component_ref = str(uuid.uuid4())
 
@@ -1037,7 +1057,9 @@ def export_cyclonedx(d):
         pkgarchs.append("all")
 
     # first loop to fill the dictionary
-    for pkg in recipes:
+    # Iterate in a stable order: `recipes` is a set, and the loops below resolve
+    # collisions on a first-one-wins basis.
+    for pkg in sorted(recipes):
         for pkgarch in pkgarchs:
             pn_list_filepath = os.path.join(d.getVar("CYCLONEDX_PNDATA"),
                                             pkgarch, f"{pkg}.json")
@@ -1061,7 +1083,7 @@ def export_cyclonedx(d):
             component_recipes.setdefault(pn_pkg["name"], pkg)
             ref_recipes[pn_pkg["bom-ref"]] = pkg
 
-    for pkg in pn_lists:
+    for pkg in sorted(pn_lists):
         pn_list = copy.deepcopy(pn_lists[pkg])
 
         for pn_pkg in pn_list["pkgs"]:
@@ -1103,7 +1125,7 @@ def export_cyclonedx(d):
     if not (d.getVar("CYCLONEDX_EXPORT_DEPENDS") or "").split():
         runtime_edges = build_runtime_dependency_edges(d)
 
-    for pkg in pn_lists:
+    for pkg in sorted(pn_lists):
         pn_list = copy.deepcopy(pn_lists[pkg])
 
         deps = pn_list.get("dependencies")
@@ -1173,7 +1195,7 @@ def export_cyclonedx(d):
     # recipe-name dependency remapping above apply to components derived from
     # Yocto packages and would corrupt an externally resolved tree.
     extra_seen_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
-    for pkg in recipes:
+    for pkg in sorted(recipes):
         pn_list = pn_lists.get(pkg)
         if not pn_list:
             continue
@@ -1450,7 +1472,10 @@ python do_export_cyclonedx() {
 # We use ROOTFS_POSTUNINSTALL_COMMAND to make sure this function runs exactly once
 # after the build process has been completed
 # see https://docs.yoctoproject.org/ref-manual/variables.html#term-ROOTFS_POSTUNINSTALL_COMMAND
-ROOTFS_POSTUNINSTALL_COMMAND =+ "do_export_cyclonedx; "
+ROOTFS_POSTUNINSTALL_COMMAND =+ "do_export_cyclonedx"
+# Looked up through a variable name argument, invisible to the signature
+export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
+    CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK"
 
 SSTATETASKS += "do_deploy_cyclonedx"
 do_deploy_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_EXPORT_DIR}"
