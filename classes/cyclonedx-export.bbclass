@@ -49,6 +49,10 @@ CYCLONEDX_IMAGE_TYPE ??= "firmware"
 # Version string for metadata.component in the CycloneDX SBOM.
 CYCLONEDX_IMAGE_VERSION ??= "${DISTRO_VERSION}${IMAGE_VERSION_SUFFIX}"
 
+# Add layer sources as external references to metadata.component in the
+# CycloneDX SBOM.
+CYCLONEDX_ADD_LAYER_REFERENCES ??= "1"
+
 # Space-separated list of recipe names to include in the SBOM regardless of
 # whether they produce rootfs packages. Use this for components that are
 # embedded directly into the image (e.g. OP-TEE inside a fitImage).
@@ -68,6 +72,10 @@ CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES ??= ""
 
 # Add component licenses (as specified within the recipe) to the SBOM
 CYCLONEDX_ADD_COMPONENT_LICENSES ??= "1"
+
+# Add component sources (as specified with SRC_URI within the recipe) as
+# external references to the SBOM.
+CYCLONEDX_ADD_COMPONENT_SOURCE_REFERENCES ??= "0"
 
 # Space-separated list of "name=value" pairs to attach to this recipe's
 # components as a CycloneDX properties array (e.g. downstream/vendor tagging
@@ -96,6 +104,9 @@ CYCLONEDX_EXPORT_SBOM_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.bom.json' if d.
 CYCLONEDX_EXPORT_VEX_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.vex.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
 CYCLONEDX_PNDATA_WORKDIR = "${WORKDIR}/cyclonedx"
 CYCLONEDX_PNDATA = "${TMPDIR}/cyclonedx/pn"
+CYCLONEDX_IMAGEDATA_WORKDIR = "${WORKDIR}/cyclonedx-image"
+# Multiconfigs may share TMPDIR while producing different variants of one image.
+CYCLONEDX_IMAGEDATA = "${TMPDIR}/cyclonedx/image/${BB_CURRENT_MC}"
 
 # We need to add the sbom serial number to the list of vulnerabilites for each recipe but
 # don't know it until after we generate the sbom export header file
@@ -452,7 +463,7 @@ def resolve_license_data(d):
     for use in CycloneDX
     """
     # load spdx license identifiers for the appropriate CycloneDX spec version
-    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION') or "1.6"
+    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION')
     layerdir = d.getVar("CYCLONEDX_LAYERDIR")
     pn = d.getVar("PN")
     licenses_file_path = f"{layerdir}/meta/files/spdx-license-list-data/licenses-{spec_version}.json"
@@ -514,7 +525,7 @@ def create_tools_metadata(d):
     """
     import uuid
 
-    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION') or "1.6"
+    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION')
 
     if spec_version == "1.4":
         # Legacy array format
@@ -577,6 +588,203 @@ def resolve_dependency_refs(depends, recipe_refs, component_recipes, ref_recipes
 
     return list(recipe_refs[recipe])
 
+def redact_credentials(text):
+    """
+    Mask the user:password component of any url in a message, so that
+    credentials from SRC_URI or a git remote never reach the build logs.
+    """
+    import re
+
+    return re.sub(r"([a-zA-Z][a-zA-Z0-9+.\-]*)://[^/?#@:\s]+(:[^/?#@:\s]*)?@",
+                  r"\1://***@", str(text))
+
+def strip_credentials(url):
+    """
+    Return a url with any user:password userinfo component removed.
+
+    Credentials from SRC_URI or a layer git remote must never be published in
+    the SBOM. Unlike redact_credentials(), this leaves a valid, portable url
+    that consumers can clone with their own credentials.
+    """
+    import re
+    import urllib.parse
+
+    try:
+        scheme, netloc, path, query, fragment = urllib.parse.urlsplit(url)
+    except ValueError:
+        return re.sub(r"://[^/?#@]*@", "://", str(url))
+    if "@" not in netloc:
+        return url
+    return urllib.parse.urlunsplit((scheme, netloc.partition("@")[2], path, query, fragment))
+
+def generate_layer_references(d):
+    """
+    Get a list of externalReferences for the layers
+    """
+    import oe.buildcfg
+
+    references = []
+    layers = oe.buildcfg.get_layer_revisions(d)
+    for (path, name, branch, rev, ismodified) in layers:
+        try:
+            repo_path = oe.buildcfg.get_metadata_git_toplevel(path)
+            if not repo_path:
+                bb.warn(f"cyclonedx-export: layer {name} is not part of a git repository, skipping its external reference")
+                continue
+            remotes = oe.buildcfg.get_metadata_git_remotes(repo_path)
+            if not remotes:
+                bb.warn(f"cyclonedx-export: layer {name} has no git remotes, skipping its external reference")
+                continue
+            remote_url = oe.buildcfg.get_metadata_git_remote_url(repo_path, remotes[0])
+        except (IndexError, OSError) as e:
+            bb.warn(f"cyclonedx-export: cannot resolve the remote url of layer {name}, skipping its external reference: {redact_credentials(e)}")
+            continue
+
+        # Only layers with a resolvable remote url get a reference.
+        if not remote_url:
+            bb.warn(f"cyclonedx-export: layer {name} has no resolvable remote url, skipping its external reference")
+            continue
+
+        # Credentials in a remote url are not publishable; keep the host/path.
+        public_remote_url = strip_credentials(remote_url)
+        if public_remote_url != remote_url:
+            bb.warn(f"cyclonedx-export: stripped credentials from the remote url of layer {name}")
+
+        reference = {
+            "url": f"{public_remote_url}@{rev}{ismodified}",
+            "type": "vcs",
+            "comment": f"Yocto metadata layer {name}"
+        }
+        references.append(reference)
+    return references
+
+def find_local_source_layer(d, local_path):
+    """
+    Find the configured Yocto layer containing a resolved local source.
+    """
+    import os
+
+    source_path = os.path.realpath(local_path)
+    match = None
+    for layer_path in (d.getVar("BBLAYERS") or "").split():
+        layer_root = os.path.realpath(layer_path)
+        try:
+            relative_path = os.path.relpath(source_path, layer_root)
+        except ValueError:
+            continue
+        if relative_path == os.pardir or relative_path.startswith(os.pardir + os.sep):
+            continue
+        if match is None or len(layer_root) > len(match[0]):
+            match = (
+                layer_root,
+                os.path.basename(os.path.normpath(layer_path)),
+                relative_path
+            )
+
+    if match is None:
+        return None
+    return {
+        "name": match[1],
+        "path": match[2].replace(os.sep, "/")
+    }
+
+def generate_source_references(d):
+    """
+    Get a list of externalReferences that has been generated from the SRC_URI
+    """
+    import os
+    import urllib.parse
+    import bb.fetch2
+    import bb.utils
+
+    references = []
+    checksum_alg_map = {
+        "md5": "MD5",
+        "sha256": "SHA-256",
+        "sha1": "SHA-1",
+        "sha384": "SHA-384",
+        "sha512": "SHA-512"
+    }
+    # Supported VCS fetchers.
+    vcs_fetcher_types = {
+        "bzr", "ccrc", "cvs", "git", "gitannex", "gitsm",
+        "hg", "osc", "p4", "repo", "svn"
+    }
+    # Building the fetcher data resolves revisions (e.g. AUTOREV or branch
+    # names for git urls). Keep this offline so SBOM generation never touches
+    # the network, and skip urls that cannot be resolved without it.
+    no_network = d.getVar("BB_NO_NETWORK")
+    d.setVar("BB_NO_NETWORK", "1")
+    try:
+        for url in (d.getVar("SRC_URI") or "").split():
+            # SRC_URI may embed credentials: log them masked, publish them stripped.
+            safe_url = redact_credentials(url)
+            public_url = strip_credentials(url)
+            if url != public_url:
+                bb.warn(f"cyclonedx-export: stripped credentials from SRC_URI entry {safe_url} in its external reference")
+            try:
+                fetcher = bb.fetch2.Fetch([url], d)
+                url_data = fetcher.ud[url]
+            except bb.fetch2.NetworkAccess:
+                bb.warn(f"cyclonedx-export: cannot resolve SRC_URI entry {safe_url} without network access, skipping its external reference")
+                continue
+
+            if url_data.type == "file":
+                try:
+                    local_path = fetcher.localpath(url)
+                except (IndexError, OSError) as e:
+                    bb.warn(f"cyclonedx-export: cannot resolve local SRC_URI entry {safe_url}, skipping its external reference: {redact_credentials(e)}")
+                    continue
+                if not local_path or not os.path.exists(local_path):
+                    bb.warn(f"cyclonedx-export: local SRC_URI entry {safe_url} does not resolve to an existing path, skipping its external reference")
+                    continue
+
+                local_layer = find_local_source_layer(d, local_path)
+                if local_layer is None:
+                    bb.warn(f"cyclonedx-export: local SRC_URI entry {safe_url} is outside the configured layers, skipping its external reference")
+                    continue
+
+                reference = {
+                    "url": "file:" + urllib.parse.quote(
+                        f"{local_layer['name']}/{local_layer['path']}"
+                    ),
+                    "type": "other",
+                    "comment": f"Yocto-local build input from layer {local_layer['name']}"
+                }
+                if os.path.isfile(local_path):
+                    reference["hashes"] = [{
+                        "alg": "SHA-512",
+                        "content": bb.utils.sha512_file(local_path)
+                    }]
+            elif getattr(url_data, "proto", None) == "file":
+                # Local VCS repositories do not provide portable references.
+                bb.warn(f"cyclonedx-export: local VCS SRC_URI entry {safe_url} does not provide a portable reference, skipping its external reference")
+                continue
+            else:
+                reference = {
+                    "url": public_url,
+                    "type": "vcs" if url_data.type in vcs_fetcher_types else "distribution"
+                }
+                revision = getattr(url_data, "revision", None)
+                if revision:
+                    reference["url"] += f"@{revision}"
+                for checksum_id in checksum_alg_map:
+                    checksum = getattr(url_data, "%s_expected" % checksum_id, None)
+                    if checksum:
+                        reference.setdefault("hashes", [])
+                        reference["hashes"].append({
+                            "alg": checksum_alg_map[checksum_id],
+                            "content": checksum
+                        })
+
+            references.append(reference)
+    finally:
+        if no_network is None:
+            d.delVar("BB_NO_NETWORK")
+        else:
+            d.setVar("BB_NO_NETWORK", no_network)
+    return references
+
 def generate_packages_list(d, products_names, version):
     """
     Get a list of products and generate CPE and PURL identifiers for each of them.
@@ -596,6 +804,8 @@ def generate_packages_list(d, products_names, version):
     # variable as used by create-spdx-3.0 in newer releases). Use the first entry
     # if set, otherwise fall back to a generic purl.
     spdx_purls = (d.getVar("SPDX_PACKAGE_URLS") or "").split()
+
+    references = generate_source_references(d) if d.getVar("CYCLONEDX_ADD_COMPONENT_SOURCE_REFERENCES") == "1" else None
 
     # some packages have alternative names, so we split CVE_PRODUCT
     # convert to set to avoid duplicates
@@ -622,6 +832,8 @@ def generate_packages_list(d, products_names, version):
         }
         if vendor != "":
             pkg["group"] = vendor
+        if references:
+            pkg["externalReferences"] = references
         packages.append(pkg)
     return packages
 
@@ -701,7 +913,7 @@ def append_to_vex(d, cve, cves, bom_ref):
 
     # Add timestamps for CycloneDX 1.6+ when enabled
     # This provides better tracking of when vulnerabilities were identified and updated
-    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION') or "1.6"
+    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION')
     add_timestamps = d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1"
 
     if spec_version == "1.6" and add_timestamps:
@@ -909,29 +1121,45 @@ def highest_priority_scope(*scopes):
     return min(known, key=priority.index)
 
 def resolve_extra_image_sbom_paths(d):
-    # Re-expand the SBOM/VEX path templates with IMAGE_BASENAME set to the
-    # referenced image, so the path is produced by exactly the same expression
-    # that image used to write the file. Reconstructing the name by hand breaks
-    # on IMAGE_NAME_SUFFIX, which is per recipe (initramfs images set it empty).
+    import os
+
+    # Read the producer's sstate-managed documents, not filenames reconstructed
+    # using this image's suffix, timestamp, export directory or link settings.
     current_pn = d.getVar("PN")
-    raw_sbom = d.getVar("CYCLONEDX_EXPORT_SBOM", False)
-    raw_vex = d.getVar("CYCLONEDX_EXPORT_VEX", False)
+    imagedata_root = d.getVar("CYCLONEDX_IMAGEDATA")
+    pkgarchs = list(reversed(d.getVar("SSTATE_ARCHS").split()))
     results = []
     for img_name in (d.getVar("CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES") or "").split():
         if img_name == current_pn:
             bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: skipping self-reference '{img_name}'")
             continue
-        d2 = d.createCopy()
-        d2.setVar("IMAGE_BASENAME", img_name)
-        d2.setVar("PN", img_name)
-        sbom = d2.expand(raw_sbom)
-        vex = d2.expand(raw_vex)
-        if sbom == d.getVar("CYCLONEDX_EXPORT_SBOM"):
-            bb.error("CYCLONEDX_EXPORT_SBOM does not vary with IMAGE_BASENAME; "
-                     f"cannot locate the SBOM for '{img_name}'")
-            continue
-        results.append((img_name, sbom, vex))
+        for pkgarch in pkgarchs:
+            imagedata_dir = os.path.join(imagedata_root, pkgarch, img_name)
+            manifest_path = os.path.join(imagedata_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                manifest = read_json(manifest_path)
+                results.append((img_name,
+                                os.path.join(imagedata_dir, manifest["sbom"]),
+                                os.path.join(imagedata_dir, manifest["vex"])))
+                break
+        else:
+            bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: image data not found for {img_name}")
     return results
+
+def write_cyclonedx_image_data(d, sbom, vex):
+    import os
+    import shutil
+
+    imagedata_dir = d.getVar("CYCLONEDX_IMAGEDATA_WORKDIR")
+    if os.path.exists(imagedata_dir):
+        shutil.rmtree(imagedata_dir)
+    bb.utils.mkdirhier(imagedata_dir)
+    write_json(os.path.join(imagedata_dir, "bom.json"), sbom)
+    write_json(os.path.join(imagedata_dir, "vex.json"), vex)
+    write_json(os.path.join(imagedata_dir, "manifest.json"), {
+        "sbom": "bom.json",
+        "vex": "vex.json",
+    })
 
 def export_cyclonedx(d):
     """
@@ -956,7 +1184,7 @@ def export_cyclonedx(d):
     vex_serial_number = str(uuid.uuid4())
 
     # Get configured spec version
-    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION') or "1.6"
+    spec_version = d.getVar('CYCLONEDX_SPEC_VERSION')
 
     # Generate sbom document header
     bb.debug(2, f"Creating empty temporary sbom file with serial number {sbom_serial_number}")
@@ -970,6 +1198,8 @@ def export_cyclonedx(d):
         "version": image_version,
         "bom-ref": metadata_component_ref
     }
+    if d.getVar("CYCLONEDX_ADD_LAYER_REFERENCES") == "1":
+        sbom_metadata["component"]["externalReferences"] = generate_layer_references(d)
 
     sbom = {
         "bomFormat": "CycloneDX",
@@ -1457,6 +1687,7 @@ def export_cyclonedx(d):
 
     write_json(export_sbom, sbom)
     write_json(export_vex, vex)
+    write_cyclonedx_image_data(d, sbom, vex)
 
     def make_deploy_symlink(target, link_name):
         if link_name and target != link_name:
@@ -1478,8 +1709,8 @@ export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
     CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK"
 
 SSTATETASKS += "do_deploy_cyclonedx"
-do_deploy_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_EXPORT_DIR}"
-do_deploy_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_EXPORT_DIR}"
+do_deploy_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_EXPORT_DIR} ${CYCLONEDX_IMAGEDATA_WORKDIR}"
+do_deploy_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_EXPORT_DIR} ${CYCLONEDX_IMAGEDATA}/${SSTATE_PKGARCH}/${PN}"
 do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_DIR"
 # Link names are stable (no timestamp) so they can safely invalidate sstate without churn.
 do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM_LINK"
@@ -1495,13 +1726,17 @@ python do_deploy_cyclonedx() {
     else:
        export_cyclonedx(d)
 }
+# Synchronize consumers with the final document producer, including its setscene
+# task. This task has no output of its own.
+do_cyclonedx_complete[noexec] = "1"
 python () {
     if bb.data.inherits_class("image", d):
         bb.build.addtask("do_deploy_cyclonedx", "do_image_complete", "do_rootfs", d)
+        bb.build.addtask("do_cyclonedx_complete", "do_build", "do_deploy_cyclonedx", d)
         pn = d.getVar("PN")
         for img in (d.getVar("CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES") or "").split():
             if img != pn:
-                d.appendVarFlag("do_rootfs", "depends", f" {img}:do_deploy_cyclonedx")
+                d.appendVarFlag("do_rootfs", "depends", f" {img}:do_cyclonedx_complete")
 }
 
 ####
