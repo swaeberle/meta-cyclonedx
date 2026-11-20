@@ -49,8 +49,21 @@ CYCLONEDX_IMAGE_NAME ??= "${IMAGE_BASENAME}"
 # Type string for metadata.component in the CycloneDX SBOM.
 CYCLONEDX_IMAGE_TYPE ??= "firmware"
 
+# Type string for components[].type in the CycloneDX SBOM.
+CYCLONEDX_COMPONENT_TYPE ??= "library"
+
 # Version string for metadata.component in the CycloneDX SBOM.
 CYCLONEDX_IMAGE_VERSION ??= "${DISTRO_VERSION}${IMAGE_VERSION_SUFFIX}"
+
+# Vendor string for the CPE of metadata.component in the CycloneDX SBOM.
+CYCLONEDX_IMAGE_VENDOR ??= ""
+
+# Add a CPE and PURL to metadata.component in the CycloneDX SBOM.
+CYCLONEDX_IMAGE_ADD_CPE_AND_PURL ??= "0"
+
+# CPE 2.3 string for metadata.component in the CycloneDX SBOM. Replaces the
+# generated CPE entirely; validated against the CPE 2.3 grammar.
+CYCLONEDX_IMAGE_CPE ??= ""
 
 # Add layer sources as external references to metadata.component in the
 # CycloneDX SBOM.
@@ -180,9 +193,12 @@ python () {
             bb.warn("CVE_STATUS_GROUPS contains undefined variable %s" % cve_status_group)
 
     # Validate renderer-relevant configuration; the supported CycloneDX
-    # versions and image types are owned by the renderer.
+    # versions and component types are owned by the renderer.
+    components_type_vars = ["CYCLONEDX_IMAGE_TYPE", "CYCLONEDX_COMPONENT_TYPE"]
     error = _cyclonedx_renderer(d).config_errors(
-        d.getVar("CYCLONEDX_SPEC_VERSION"), d.getVar("CYCLONEDX_IMAGE_TYPE"))
+        d.getVar("CYCLONEDX_SPEC_VERSION"),
+        {var:d.getVar(var) for var in components_type_vars},
+        d.getVar("CYCLONEDX_IMAGE_CPE"))
     if error:
         bb.fatal(error)
 }
@@ -205,6 +221,9 @@ python do_populate_cyclonedx() {
     name = d.getVar("CVE_PRODUCT")
     version = d.getVar("CVE_VERSION")
     cpe_update = d.getVar("CYCLONEDX_CPE_UPDATE")
+
+    # get component type
+    component_type = d.getVar("CYCLONEDX_COMPONENT_TYPE")
 
     # We create and populate a per-recipe partial sbom which will be added to the sstate cache
     pn_list = {}
@@ -242,7 +261,7 @@ python do_populate_cyclonedx() {
             purl = spdx_purls[0]
         else:
             purl = 'pkg:generic/{}{}@{}'.format(f"{vendor}/" if vendor else '', product, short_version)
-        for pkg in renderer.component_identity(name, version, cpe_update, purl, references):
+        for pkg in renderer.component_identity(name, version, cpe_update, purl, component_type, references):
             # Check if we already have a package with this CPE
             existing_pkg = next((c for c in pn_list["pkgs"] if c["cpe"] == pkg["cpe"]), None)
             if existing_pkg:
@@ -265,9 +284,20 @@ python do_populate_cyclonedx() {
             pn_list["pkgs"].append(pkg)
             bom_ref = pkg["bom-ref"]
 
-            # append any CVEs patched
+            # append any CVEs patched by a patch file. get_patched_cves() also
+            # returns the CVE_STATUS entries with decoded status "Patched"; leave
+            # those to the CVE_STATUS loop below so that their state and
+            # justification are kept instead of being replaced by "fix-file-included".
             patched_cves = get_patched_cves(d)
-            for cve_id in patched_cves:
+            cve_status = d.getVarFlags("CVE_STATUS") or {}
+            # Compare normalized ids: get_patched_cves() reports the bare CVE id
+            # of a patch file name, while a CVE_STATUS entry can be keyed with a
+            # patch file suffix, and the renderer deduplicates by normalized id.
+            status_patched = {renderer.normalize_cve_id(c)
+                              for c in cve_status
+                              if decode_cve_status(d, c)[0] == "Patched"}
+            for cve_id in sorted(c for c in patched_cves
+                                 if renderer.normalize_cve_id(c) not in status_patched):
                 cve = (
                     cve_id,
                     "Patched",
@@ -282,11 +312,8 @@ python do_populate_cyclonedx() {
 
             # in scarthgap the get_patched_cves function filters CVE_STATUS to only
             # include "Patched" decoded status, however we want "Ignored" statuses as well.
-            for cve_id in (d.getVarFlags("CVE_STATUS") or {}):
+            for cve_id in cve_status:
                 decoded_status, state, justification = decode_cve_status(d, cve_id)
-                # avoid duplicates
-                if decoded_status == "Patched":
-                    continue
                 cve = (
                     cve_id,
                     decoded_status,
@@ -602,7 +629,7 @@ def redact_credentials(text):
     """
     import re
 
-    return re.sub(r"([a-zA-Z][a-zA-Z0-9+.\-]*)://[^/?#@:\s]+(:[^/?#@:\s]*)?@",
+    return re.sub(r"([a-zA-Z][a-zA-Z0-9+.\-]*)(?<!file)://(?!git@)[^/?#@:\s]+(:[^/?#@:\s]*)?@",
                   r"\1://***@", str(text))
 
 def strip_credentials(url):
@@ -619,10 +646,70 @@ def strip_credentials(url):
     try:
         scheme, netloc, path, query, fragment = urllib.parse.urlsplit(url)
     except ValueError:
-        return re.sub(r"://[^/?#@]*@", "://", str(url))
-    if "@" not in netloc:
+        return re.sub(r"(?<!file)://(?!git@)[^/?#@]*@", "://", str(url))
+    if "@" not in netloc or scheme == "file" or netloc.startswith("git@"):
         return url
     return urllib.parse.urlunsplit((scheme, netloc.partition("@")[2], path, query, fragment))
+
+def get_layer_public_remote_url(d, layer_path, layer_name):
+    """
+    Get the remote url of a layer in publishable URI form, with the
+    credentials stripped.
+    If this fails, raise a RuntimeError with the "cyclonedx-export" prefix and
+    the reason.
+    """
+    import oe.buildcfg
+
+    try:
+        repo_path = oe.buildcfg.get_metadata_git_toplevel(layer_path)
+        if not repo_path:
+            raise RuntimeError(f"cyclonedx-export: layer {layer_name} is not part of a git repository")
+        remotes = oe.buildcfg.get_metadata_git_remotes(repo_path)
+        if not remotes:
+            raise RuntimeError(f"cyclonedx-export: layer {layer_name} has no git remotes")
+        remote_url = oe.buildcfg.get_metadata_git_remote_url(repo_path, remotes[0])
+    except (IndexError, OSError) as e:
+        raise RuntimeError(f"cyclonedx-export: cannot resolve the remote url of layer {layer_name}: {redact_credentials(e)}")
+
+    # Only layers with a resolvable remote url get a reference.
+    if not remote_url:
+        raise RuntimeError(f"cyclonedx-export: layer {layer_name} has no resolvable remote url")
+
+    # Credentials in a remote url are not publishable; keep the host/path.
+    public_remote_url = strip_credentials(remote_url)
+    if public_remote_url != remote_url:
+        bb.warn(f"cyclonedx-export: stripped credentials from the remote url of layer {layer_name}")
+    # scp-style remotes ("git@host:path") are not URIs and would not pass
+    # schema validation; publish the equivalent ssh:// url instead.
+    return _cyclonedx_renderer(d).git_url_as_uri(public_remote_url)
+
+def image_purl_facts(d):
+    """
+    Collect the base PURL and the layer facts of the image PURL. Returns a
+    (base_purl, layer_version, repository_url) tuple; facts that cannot be
+    resolved are None and the renderer omits the matching qualifier.
+    """
+    import oe.purl
+    import oe.buildcfg
+
+    base_purl = oe.purl.get_base_purl(d)
+    source_layer = find_local_source_layer(d, d.getVar("FILE"))
+    if source_layer is None:
+        bb.warn("cyclonedx-export: the image recipe is outside the configured layers, not adding layer qualifiers to the image PURL")
+        return base_purl, None, None
+
+    layer_path = source_layer["root"]
+    layer_version = oe.buildcfg.get_metadata_git_revision(layer_path)
+    if not layer_version or layer_version == "<unknown>":
+        layer_version = None
+    try:
+        repository_url = get_layer_public_remote_url(d, layer_path, source_layer["name"])
+    except RuntimeError as e:
+        if not str(e).startswith("cyclonedx-export"):
+            raise
+        bb.warn(f"{e}, not including its remote url in the image PURL")
+        repository_url = None
+    return base_purl, layer_version, repository_url
 
 def generate_layer_references(d):
     """
@@ -634,32 +721,12 @@ def generate_layer_references(d):
     layers = oe.buildcfg.get_layer_revisions(d)
     for (path, name, branch, rev, ismodified) in layers:
         try:
-            repo_path = oe.buildcfg.get_metadata_git_toplevel(path)
-            if not repo_path:
-                bb.warn(f"cyclonedx-export: layer {name} is not part of a git repository, skipping its external reference")
-                continue
-            remotes = oe.buildcfg.get_metadata_git_remotes(repo_path)
-            if not remotes:
-                bb.warn(f"cyclonedx-export: layer {name} has no git remotes, skipping its external reference")
-                continue
-            remote_url = oe.buildcfg.get_metadata_git_remote_url(repo_path, remotes[0])
-        except (IndexError, OSError) as e:
-            bb.warn(f"cyclonedx-export: cannot resolve the remote url of layer {name}, skipping its external reference: {redact_credentials(e)}")
+            public_remote_url = get_layer_public_remote_url(d, path, name)
+        except RuntimeError as e:
+            if not str(e).startswith("cyclonedx-export"):
+                raise
+            bb.warn(f"{e}, skipping its external reference")
             continue
-
-        # Only layers with a resolvable remote url get a reference.
-        if not remote_url:
-            bb.warn(f"cyclonedx-export: layer {name} has no resolvable remote url, skipping its external reference")
-            continue
-
-        # Credentials in a remote url are not publishable; keep the host/path.
-        public_remote_url = strip_credentials(remote_url)
-        if public_remote_url != remote_url:
-            bb.warn(f"cyclonedx-export: stripped credentials from the remote url of layer {name}")
-
-        # scp-style remotes ("git@host:path") are not URIs and would not pass
-        # schema validation; publish the equivalent ssh:// url instead.
-        public_remote_url = _cyclonedx_renderer(d).git_url_as_uri(public_remote_url)
 
         reference = {
             "url": f"{public_remote_url}@{rev}",
@@ -696,6 +763,7 @@ def find_local_source_layer(d, local_path):
         return None
     return {
         "name": match[1],
+        "root": match[0],
         "path": match[2].replace(os.sep, "/")
     }
 
@@ -1162,6 +1230,15 @@ def export_cyclonedx(d):
         "name": d.getVar("CYCLONEDX_IMAGE_NAME") or d.getVar("PN") or "image",
         "version": d.getVar("CYCLONEDX_IMAGE_VERSION") or "unknown",
     }
+    if d.getVar("CYCLONEDX_IMAGE_ADD_CPE_AND_PURL") == "1":
+        renderer = _cyclonedx_renderer(d)
+        primary["cpe"] = renderer.image_cpe(
+            primary["type"],
+            d.getVar("CYCLONEDX_IMAGE_VENDOR") or "",
+            primary["name"],
+            primary["version"],
+            d.getVar("CYCLONEDX_IMAGE_CPE") or None)
+        primary["purl"] = renderer.image_purl(*image_purl_facts(d))
     if d.getVar("CYCLONEDX_ADD_LAYER_REFERENCES") == "1":
         primary["external_references"] = generate_layer_references(d)
 

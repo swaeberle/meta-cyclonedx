@@ -91,12 +91,40 @@ def test_spec_16_omits_citations_and_tlp():
 
 
 def test_config_validation_names_supported_values():
-    assert meta_cyclonedx.config_errors("1.7", "firmware") is None
+    assert meta_cyclonedx.config_errors(
+        "1.7", {"CYCLONEDX_IMAGE_TYPE": "firmware"}) is None
 
-    error = meta_cyclonedx.config_errors("1.4", "firmware")
+    error = meta_cyclonedx.config_errors("1.4", {"CYCLONEDX_IMAGE_TYPE": "firmware"})
     assert "Unsupported CYCLONEDX_SPEC_VERSION: 1.4" in error
     assert "1.6" in error and "1.7" in error
 
-    error = meta_cyclonedx.config_errors("1.7", "kitchen-appliance")
+    error = meta_cyclonedx.config_errors("1.7", {"CYCLONEDX_IMAGE_TYPE": "kitchen-appliance"})
     assert "CYCLONEDX_IMAGE_TYPE" in error
     assert "firmware" in error
+
+    error = meta_cyclonedx.config_errors(
+        "1.7", {"CYCLONEDX_IMAGE_TYPE": "firmware",
+                "CYCLONEDX_COMPONENT_TYPE": "kitchen-appliance"})
+    assert "CYCLONEDX_COMPONENT_TYPE" in error
+
+
+def test_primary_cpe_and_purl_facts_are_emitted_on_the_component():
+    facts = default_facts(primary={
+        "type": "firmware", "name": "core-image", "version": "1.0",
+        "cpe": "cpe:2.3:o:vendor:core-image:1.0:*:*:*:*:*:*:*",
+        "purl": "pkg:yocto/core/core-image@1.0?layer_version=abc123",
+    })
+
+    sbom, _vex, _logs = render_docs(facts)
+
+    assert sbom["metadata"]["component"]["cpe"] == \
+        "cpe:2.3:o:vendor:core-image:1.0:*:*:*:*:*:*:*"
+    assert sbom["metadata"]["component"]["purl"] == \
+        "pkg:yocto/core/core-image@1.0?layer_version=abc123"
+
+
+def test_primary_component_without_identifier_facts_carries_neither():
+    sbom, _vex, _logs = render_docs(default_facts())
+
+    assert "cpe" not in sbom["metadata"]["component"]
+    assert "purl" not in sbom["metadata"]["component"]
